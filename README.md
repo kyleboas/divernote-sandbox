@@ -49,7 +49,7 @@ sbx's own OpenAI login.
 
 - A new session's sandbox is ready in about 15 seconds; later turns reuse it.
   It starts from a saved image with the agents installed (`sbx template ls`
-  shows `divernote-agents`). The image is built once, and again whenever
+  shows `divernote-sandbox`). The image is built once, and again whenever
   `kit/` changes, which takes a few minutes. To update Claude Code or Pi,
   change their versions in `kit/spec.yaml`.
 - It stops when no agent is using it and is removed once Divernote removes

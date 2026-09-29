@@ -1,8 +1,8 @@
 schemaVersion: "2"
 kind: sandbox
-name: divernote-agents
+name: divernote-sandbox
 version: "0.1.0"
-displayName: Divernote agents
+displayName: Divernote sandbox
 description: The coding agents Divernote runs on issues. Credentials stay on the Mac; the sandbox proxy adds them to requests.
 
 extends: codex
