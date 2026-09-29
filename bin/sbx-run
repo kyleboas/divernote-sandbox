@@ -1,0 +1,390 @@
+#!/usr/bin/python3
+"""sbx: run one Divernote agent launch inside a Docker Sandboxes VM.
+
+index.mjs starts every agent launch as
+
+    sbx-run --agent <agent> --cwd <dir> --session <id> -- <command> [args...]
+
+Each Divernote session gets its own sandbox, `dn-<session>`. It sees only the
+issue folder, the Git data behind it, the agent's own conversation files and
+any file the launch names; everything else on the Mac is out of reach.
+Credentials never enter it: the sandbox proxy adds them to requests.
+"""
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from contextlib import contextmanager
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+KIT = HERE.parent / "kit"
+HOME = Path.home()
+SEARCH_PATH = f"{HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+SBX = shutil.which("sbx", path=SEARCH_PATH) or "sbx"
+CPUS = "4"
+MEMORY = "8g"
+
+
+def config_home(env):
+    base = env.get("XDG_CONFIG_HOME")
+    return Path(base if base and base.startswith("/") else HOME / ".config") / "divernotes"
+
+
+STATE = config_home(os.environ) / "sbx"
+
+
+def say(text):
+    print(f"sbx: {text}", file=sys.stderr, flush=True)
+
+
+def sbx(*args, check=True, quiet=True):
+    return subprocess.run([SBX, *args], check=check, text=True, stdin=subprocess.DEVNULL,
+                          capture_output=quiet)
+
+
+def parse(argv):
+    options, rest = {}, list(argv)
+    while rest and rest[0] != "--":
+        key = rest.pop(0)
+        if not key.startswith("--") or not rest:
+            raise SystemExit(f"sbx-run: bad option {key}")
+        options[key[2:]] = rest.pop(0)
+    if not rest or len(rest) < 2:
+        raise SystemExit("usage: sbx-run --agent A --cwd DIR --session ID -- COMMAND [ARGS...]")
+    return options, rest[1], rest[2:]
+
+
+def sandbox_name(session):
+    return "dn-" + (re.sub(r"[^A-Za-z0-9.-]", "-", session).strip("-.") or "session")[:60]
+
+
+# --- What the sandbox sees ---------------------------------------------------
+
+def git_mounts(cwd):
+    """The issue's Git data, writable, with every file Git would run code from read-only.
+
+    A writable `config`, hook or `commondir` would let the agent run code the
+    next time Git runs on the Mac, so those stay read-only.
+    """
+    writable, read_only = [], []
+    dotgit = cwd / ".git"
+    if dotgit.is_file():
+        match = re.match(r"gitdir:\s*(.+)", dotgit.read_text().strip())
+        if not match:
+            return writable, read_only
+        gitdir = (cwd / match.group(1)).resolve()
+        commondir = gitdir / "commondir"
+        common = (gitdir / commondir.read_text().strip()).resolve() if commondir.is_file() else gitdir
+        writable += [common, gitdir]
+        read_only += [dotgit, common / "config", common / "hooks", common / "worktrees",
+                      commondir, gitdir / "gitdir", gitdir / "config.worktree"]
+    elif dotgit.is_dir():
+        read_only += [dotgit / "config", dotgit / "hooks"]
+    return writable, [path for path in read_only if path.exists()]
+
+
+def claude_config_dir(env):
+    value = env.get("CLAUDE_CONFIG_DIR")
+    return Path(value) if value and value.startswith("/") else HOME / ".claude"
+
+
+def claude_projects(env, cwd):
+    """Where the Mac keeps this folder's Claude transcripts (followed through links)."""
+    folder = claude_config_dir(env) / "projects"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder.resolve() / re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
+
+
+def pi_sessions(env, cwd):
+    custom = env.get("PI_CODING_AGENT_SESSION_DIR")
+    if custom and custom.startswith("/"):
+        return Path(custom)
+    agent_dir = env.get("PI_CODING_AGENT_DIR")
+    agent_dir = Path(agent_dir) if agent_dir and agent_dir.startswith("/") else HOME / ".pi" / "agent"
+    return agent_dir / "sessions" / ("--" + re.sub(r"[/\\:]", "-", str(cwd).lstrip("/\\")) + "--")
+
+
+def is_claude(agent, command):
+    return agent == "claude" or Path(command).name == "claude"
+
+
+def is_pi(agent, command):
+    return agent == "pi" or Path(command).name == "pi"
+
+
+def within(path, folders):
+    return any(path == folder or folder in path.parents for folder in folders)
+
+
+# --- Credentials ---------------------------------------------------------------
+
+def secrets():
+    listing = json.loads(sbx("secret", "ls", "--json").stdout or "{}")
+    return {item["env"]: item for item in listing.get("custom_secrets") or []
+            if item.get("scope") == "global" and item.get("env")}
+
+
+def placeholder(known, env_name, hosts, command):
+    """A global sbx secret that runs `command` on the Mac; the sandbox only ever sees a placeholder."""
+    item = known.get(env_name)
+    if not item or item.get("source") != command or sorted(item.get("targets") or []) != sorted(hosts):
+        host_flags = [flag for host in hosts for flag in ("--host", host)]
+        sbx("secret", "set-custom", *host_flags, "--env", env_name, "--command", command)
+        item = secrets()[env_name]
+    return item["placeholder"]
+
+
+def credentials(agent, command, env):
+    known = secrets()
+    python = shlex.quote(sys.executable)
+    github = shlex.quote(str(HERE / "github-auth"))
+    values = {
+        "GH_TOKEN": placeholder(known, "DIVERNOTE_SBX_GITHUB_TOKEN", ["api.github.com"], f"{python} {github} token"),
+        "DN_GIT_AUTH": placeholder(known, "DIVERNOTE_SBX_GITHUB_GIT", ["github.com"], f"{python} {github} git"),
+    }
+    if is_claude(agent, command):
+        # One secret per Claude account, so account rotation keeps working.
+        config_dir = str(claude_config_dir(env))
+        suffix = hashlib.sha256(config_dir.encode()).hexdigest()[:8].upper()
+        token = f"{python} {shlex.quote(str(HERE / 'claude-token'))} {shlex.quote(config_dir)}"
+        values["CLAUDE_CODE_OAUTH_TOKEN"] = placeholder(
+            known, f"DIVERNOTE_SBX_CLAUDE_{suffix}", ["api.anthropic.com", "platform.claude.com"], token)
+    return values
+
+
+def git_identity(cwd):
+    """The author Git uses for this folder on the Mac, so commits look the same."""
+    result = subprocess.run(["git", "var", "GIT_AUTHOR_IDENT"], cwd=cwd, capture_output=True, text=True)
+    match = re.match(r"(.*) <(.*)>", result.stdout.strip())
+    if not match:
+        return {}
+    name, email = match.groups()
+    return {"GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": email,
+            "GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": email}
+
+
+# --- Sandbox lifecycle -----------------------------------------------------------
+
+@contextmanager
+def locked(name):
+    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with open(STATE / f"{name}.lock", "a+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def read_state(name):
+    try:
+        return json.loads((STATE / f"{name}.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def write_state(name, state):
+    path = STATE / f"{name}.json"
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(state, indent=2) + "\n")
+    os.replace(temporary, path)
+
+
+def existing_sandboxes():
+    listing = json.loads(sbx("ls", "--json").stdout or "{}")
+    return {item.get("name") for item in listing.get("sandboxes") or []}
+
+
+def ensure_sandbox(name, cwd, mounts):
+    """Create the sandbox, or recreate it when what it should see has changed.
+
+    Nothing worth keeping lives only in a sandbox: the work and the
+    conversation are in the mounted folders.
+    """
+    state = read_state(name)
+    exists = name in existing_sandboxes()
+    if exists and state.get("mounts") == mounts:
+        return state
+    if exists:
+        sbx("rm", "-f", name, check=False)
+    say("preparing a sandbox for this session (about a minute the first time)")
+    for attempt in (1, 2):
+        result = sbx("create", "--name", name, "-q", "--cpus", CPUS, "--memory", MEMORY, str(KIT), *mounts, check=False)
+        if result.returncode == 0:
+            break
+        if attempt == 2:
+            say((result.stderr or result.stdout).strip() or "the sandbox could not be created")
+            raise SystemExit(1)
+    state = {"cwd": str(cwd), "mounts": mounts, "users": state.get("users", 0)}
+    write_state(name, state)
+    return state
+
+
+def join(name):
+    with locked(name):
+        state = read_state(name)
+        state["users"] = state.get("users", 0) + 1
+        write_state(name, state)
+
+
+def leave(name):
+    """Stop the sandbox once nothing is using it, so it holds no memory."""
+    with locked(name):
+        state = read_state(name)
+        state["users"] = max(0, state.get("users", 0) - 1)
+        write_state(name, state)
+        if state["users"] == 0:
+            subprocess.Popen([SBX, "stop", name], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def collect_garbage():
+    """Remove sandboxes whose issue folder is gone (Divernote removes it when the issue is done)."""
+    for path in STATE.glob("dn-*.json"):
+        name = path.stem
+        try:
+            with locked(name):
+                state = read_state(name)
+                if state.get("users", 0) or Path(state.get("cwd", "/")).exists():
+                    continue
+                sbx("rm", "-f", name, check=False)
+                path.unlink(missing_ok=True)
+                shutil.rmtree(STATE / "outbox" / name, ignore_errors=True)
+            (STATE / f"{name}.lock").unlink(missing_ok=True)
+        except OSError:
+            continue
+
+
+def mirror(outbox, target, stop):
+    """Files the agent creates in its outbox appear in Divernote's lock folder (e.g. Claude's Stop marker)."""
+    while True:
+        for item in outbox.iterdir():
+            if item.is_file():
+                (target / item.name).touch()
+                item.unlink(missing_ok=True)
+        if stop.wait(0.3):
+            if not any(outbox.iterdir()):
+                return
+
+
+# Runs inside the sandbox before the agent: wires Git to the proxied
+# credential, points Claude at the mounted transcript folder, trusts the issue
+# folder, then becomes the agent.
+SETUP = r'''
+set -e
+# The base image's placeholder API key would win over the subscription token.
+unset ANTHROPIC_API_KEY
+git config --global --replace-all http.https://github.com/.extraHeader "Authorization: $DN_GIT_AUTH"
+if [ -n "$DN_CLAUDE_PROJECTS" ]; then
+  mkdir -p "$HOME/.claude/projects"
+  ln -sfn "$DN_CLAUDE_PROJECTS" "$HOME/.claude/projects/$(basename "$DN_CLAUDE_PROJECTS")"
+  jq --arg p "$DN_CWD" '.projects[$p].hasTrustDialogAccepted = true' "$HOME/.claude.json" > "$HOME/.claude.json.tmp"
+  mv "$HOME/.claude.json.tmp" "$HOME/.claude.json"
+fi
+if [ -n "$DN_PI_SETTINGS" ] && [ ! -e "$HOME/.pi/agent/settings.json" ]; then
+  printf '%s\n' "$DN_PI_SETTINGS" > "$HOME/.pi/agent/settings.json"
+fi
+[ -z "$DN_PI_MODELS" ] || cp "$DN_PI_MODELS" "$HOME/.pi/agent/models-store.json"
+unset DN_GIT_AUTH DN_CLAUDE_PROJECTS DN_PI_SETTINGS DN_PI_MODELS
+cd "$DN_CWD"
+exec "$@"
+'''
+
+PASS_THROUGH = ("TERM", "COLORTERM", "LANG", "LC_ALL", "LC_CTYPE", "TZ")
+
+
+def main():
+    options, command, args = parse(sys.argv[1:])
+    env = os.environ
+    agent = options.get("agent", "")
+    cwd = Path(options.get("cwd") or os.getcwd()).resolve()
+    name = sandbox_name(options.get("session") or cwd.name)
+    threading.Thread(target=collect_garbage, daemon=True).start()
+
+    writable, read_only = [cwd], []
+    git_writable, git_read_only = git_mounts(cwd)
+    writable += git_writable
+    read_only += git_read_only
+    inside = {"DN_CWD": str(cwd), **git_identity(cwd)}
+
+    if is_claude(agent, command):
+        projects = claude_projects(env, cwd)
+        projects.mkdir(parents=True, exist_ok=True, mode=0o700)
+        writable.append(projects)
+        inside["DN_CLAUDE_PROJECTS"] = str(projects)
+    if is_pi(agent, command):
+        sessions = pi_sessions(env, cwd)
+        sessions.mkdir(parents=True, exist_ok=True, mode=0o700)
+        writable.append(sessions)
+        inside["PI_CODING_AGENT_SESSION_DIR"] = str(sessions)
+        try:
+            settings = json.loads((HOME / ".pi" / "agent" / "settings.json").read_text())
+            defaults = {key: settings[key] for key in ("defaultProvider", "defaultModel", "defaultThinkingLevel") if key in settings}
+            inside["DN_PI_SETTINGS"] = json.dumps(defaults)
+        except (OSError, ValueError):
+            pass
+        # Pi's model list (no credentials), so the Mac's default model exists here too.
+        models = HOME / ".pi" / "agent" / "models-store.json"
+        if models.is_file():
+            read_only.append(models.resolve())
+            inside["DN_PI_MODELS"] = str(models.resolve())
+
+    # Divernote's lock folder holds every session's locks; the agent gets an
+    # outbox instead, mirrored back while it runs.
+    locks = str(config_home(env) / "pi-locks") + "/"
+    outbox = None
+    if any(locks in arg for arg in args):
+        outbox = STATE / "outbox" / name
+        outbox.mkdir(parents=True, exist_ok=True, mode=0o700)
+        args = [arg.replace(locks, str(outbox) + "/") for arg in args]
+        writable.append(outbox)
+
+    # Files the launch names (Pi extensions, settings) are readable, nothing more.
+    for arg in args:
+        path = Path(arg)
+        if arg.startswith("/") and path.is_file() and not within(path.resolve(), writable):
+            read_only.append(path.resolve())
+
+    mounts = [str(writable[0])] + sorted(
+        [str(path) for path in writable[1:]] + [f"{path}:ro" for path in read_only],
+        key=lambda item: item.count("/"))
+    mounts = list(dict.fromkeys(mounts))
+
+    with locked(name):
+        ensure_sandbox(name, cwd, mounts)
+    inside.update(credentials(agent, command, env))
+    inside.update({key: env[key] for key in PASS_THROUGH if env.get(key)})
+
+    stop, mirroring = threading.Event(), None
+    if outbox:
+        mirroring = threading.Thread(target=mirror, args=(outbox, Path(locks), stop), daemon=True)
+        mirroring.start()
+
+    tty = ["-t"] if sys.stdin.isatty() and sys.stdout.isatty() else []
+    env_flags = [flag for key, value in inside.items() for flag in ("-e", f"{key}={value}")]
+    join(name)
+    try:
+        child = subprocess.Popen([SBX, "exec", "-i", *tty, *env_flags, name,
+                                  "sh", "-c", SETUP, "sbx-agent", Path(command).name, *args])
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(signum, lambda number, _frame: child.poll() is None and child.send_signal(number))
+        code = child.wait()
+    finally:
+        stop.set()
+        if mirroring:
+            mirroring.join(timeout=5)
+        leave(name)
+    return code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

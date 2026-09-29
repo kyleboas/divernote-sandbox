@@ -1,0 +1,80 @@
+#!/usr/bin/python3
+"""Print the current Claude access token for one account: `claude-token <config dir>`.
+
+The sbx proxy runs this on the Mac and adds the token to the sandbox's
+requests to Anthropic; the sandbox never sees it. Claude Code on macOS keeps
+the live token in the Keychain. When it is about to expire, a one-line
+`claude -p` on the Mac refreshes it.
+"""
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+HOME = Path.home()
+REFRESH_BEFORE = 15 * 60
+
+
+def keychain(service):
+    result = subprocess.run(["/usr/bin/security", "find-generic-password", "-s", service, "-w"],
+                            capture_output=True, text=True)
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def oauth(config_dir):
+    services = [f"Claude Code-credentials-{hashlib.sha256(str(config_dir).encode()).hexdigest()[:8]}"]
+    if config_dir == HOME / ".claude":
+        services.append("Claude Code-credentials")
+    sources = [keychain(service) for service in services]
+    try:
+        sources.append((config_dir / ".credentials.json").read_text())
+    except OSError:
+        pass
+    found = []
+    for text in sources:
+        try:
+            value = json.loads(text).get("claudeAiOauth") or {}
+        except (ValueError, AttributeError):
+            continue
+        if isinstance(value.get("accessToken"), str) and value["accessToken"]:
+            found.append(value)
+    # The freshest one wins; an old credentials file must not shadow the Keychain.
+    return max(found, key=lambda value: value.get("expiresAt") or 0, default={})
+
+
+def seconds_left(value):
+    expires = value.get("expiresAt") or 0
+    return (expires / 1000 if expires > 100_000_000_000 else expires) - time.time()
+
+
+def refresh(config_dir):
+    claude = shutil.which("claude", path=f"{HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin")
+    if not claude:
+        return
+    env = {key: value for key, value in os.environ.items() if not key.startswith(("CLAUDE", "ANTHROPIC"))}
+    env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+    with tempfile.TemporaryDirectory() as folder:
+        subprocess.run([claude, "-p", "--model", "haiku", "--max-turns", "1", "--no-session-persistence", "Reply with: ok"],
+                       cwd=folder, env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=120)
+
+
+def main():
+    if len(sys.argv) != 2 or not sys.argv[1].startswith("/"):
+        sys.exit("usage: claude-token <absolute config dir>")
+    config_dir = Path(sys.argv[1])
+    value = oauth(config_dir)
+    if seconds_left(value) < REFRESH_BEFORE:
+        refresh(config_dir)
+        value = oauth(config_dir)
+    if not value.get("accessToken"):
+        sys.exit(f"No Claude login for {config_dir}")
+    sys.stdout.write(value["accessToken"] + "\n")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,24 @@
+#!/usr/bin/python3
+"""Print GitHub credentials from the Mac's `gh` login.
+
+    github-auth token   the token, for `gh` (GH_TOKEN)
+    github-auth git     an Authorization header value, for Git over HTTPS
+
+The sbx proxy runs this on the Mac; the sandbox only sees placeholders.
+"""
+import base64
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+gh = shutil.which("gh", path=f"{Path.home()}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin")
+if len(sys.argv) != 2 or sys.argv[1] not in ("token", "git") or not gh:
+    sys.exit("usage: github-auth token|git (needs gh)")
+result = subprocess.run([gh, "auth", "token"], capture_output=True, text=True)
+token = result.stdout.strip()
+if result.returncode or not token:
+    sys.exit("The Mac's gh is not logged in to GitHub")
+if sys.argv[1] == "git":
+    token = "Basic " + base64.b64encode(f"x-access-token:{token}".encode()).decode()
+sys.stdout.write(token + "\n")

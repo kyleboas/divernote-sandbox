@@ -1,0 +1,41 @@
+schemaVersion: "2"
+kind: sandbox
+name: divernote-agents
+version: "0.1.0"
+displayName: Divernote agents
+description: The coding agents Divernote runs on issues. Credentials stay on the Mac; the sandbox proxy adds them to requests.
+
+extends: codex
+
+environment:
+  variables:
+    DISABLE_TELEMETRY: "1"
+    DISABLE_ERROR_REPORTING: "1"
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+    PI_SKIP_VERSION_CHECK: "1"
+
+setup:
+  install:
+    - command: "npm install -g @anthropic-ai/claude-code@2.1.284 @earendil-works/pi-coding-agent@0.87.0 --fetch-retries=5"
+      user: "0"
+      description: Install Claude Code and Pi
+
+# Everything else is blocked. Add a host here when an agent needs it.
+permissions:
+  network:
+    allow:
+      # Claude
+      - api.anthropic.com:443
+      - platform.claude.com:443
+      # Pi on a ChatGPT subscription
+      - chatgpt.com:443
+      - api.openai.com:443
+      - auth.openai.com:443
+      # GitHub: fetch, push, pull requests
+      - github.com:443
+      - api.github.com:443
+      - codeload.github.com:443
+      - objects.githubusercontent.com:443
+      - raw.githubusercontent.com:443
+      # Packages
+      - registry.npmjs.org:443
