@@ -16,7 +16,8 @@ environment:
 
 setup:
   install:
-    - command: "npm install -g @anthropic-ai/claude-code@2.1.284 @earendil-works/pi-coding-agent@0.87.0 --fetch-retries=5"
+    # A no-op when the sandbox starts from the template, which already has them.
+    - command: "claude --version 2>/dev/null | grep -q '^2.1.284 ' && pi --version 2>/dev/null | grep -qx 0.87.0 || npm install -g @anthropic-ai/claude-code@2.1.284 @earendil-works/pi-coding-agent@0.87.0 --fetch-retries=5"
       user: "0"
       description: Install Claude Code and Pi
 
