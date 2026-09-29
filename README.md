@@ -35,7 +35,12 @@ One sandbox per Divernote session, named `dn-<session>`:
   Git run code on the Mac;
 - the agent's own conversation folder, so Divernote can read replies
   (Claude: `~/.claude/projects/<folder>`, Pi: `~/.pi/agent/sessions/<folder>`);
-- files the launch names, such as Pi extensions, read-only.
+- files the launch names, such as Pi extensions, read-only;
+- the folder macOS saves screenshots to, read-only, so an agent can open a
+  screenshot you mention by its path. It is the Desktop unless you changed
+  it (`defaults write com.apple.screencapture location ~/Desktop/Screenshots`
+  keeps the rest of the Desktop out). The agent finds it in
+  `$DIVERNOTE_SCREENSHOTS`.
 
 Nothing else on the Mac. The network allows only the hosts in
 `kit/spec.yaml`; add one there when an agent needs it.

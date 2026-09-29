@@ -113,6 +113,22 @@ def pi_sessions(env, cwd):
     return agent_dir / "sessions" / ("--" + re.sub(r"[/\\:]", "-", str(cwd).lstrip("/\\")) + "--")
 
 
+def screenshots_folder():
+    """Where macOS saves screenshots (Desktop unless changed), if it is a folder of its own."""
+    try:
+        result = subprocess.run(["/usr/bin/defaults", "read", "com.apple.screencapture", "location"],
+                                capture_output=True, text=True, timeout=5)
+        custom = result.stdout.strip() if result.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired):
+        custom = ""
+    folder = Path(os.path.expanduser(custom)) if custom else HOME / "Desktop"
+    try:
+        folder = folder.resolve()
+    except OSError:
+        return None
+    return folder if folder.is_dir() and folder != HOME and HOME in folder.parents else None
+
+
 def is_claude(agent, command):
     return agent == "claude" or Path(command).name == "claude"
 
@@ -388,6 +404,12 @@ def main():
         outbox.mkdir(parents=True, exist_ok=True, mode=0o700)
         args = [arg.replace(locks, str(outbox) + "/") for arg in args]
         writable.append(outbox)
+
+    # Screenshots can be read by path, never changed.
+    screenshots = screenshots_folder()
+    if screenshots and not within(screenshots, writable):
+        read_only.append(screenshots)
+        inside["DIVERNOTE_SCREENSHOTS"] = str(screenshots)
 
     # Files the launch names (Pi extensions, settings) are readable, nothing more.
     for arg in args:
