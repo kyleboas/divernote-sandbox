@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""`divernote` inside the sandbox: notes only, run on the Mac through the notes bridge.
+
+    divernote agent-items retrieve --type note [--id <id>] --json
+    divernote agent-items add --type note --text <text> [--date <ISO>] --json
+    divernote agent-items edit --type note --id <id> --text <text> [--date <ISO>] --json
+"""
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+USAGE = __doc__.split("\n\n", 1)[1]
+
+
+def fail(message, code=2):
+    sys.stderr.write(message.rstrip() + "\n")
+    raise SystemExit(code)
+
+
+def main(argv):
+    url, token = os.environ.get("DIVERNOTE_NOTES_URL"), os.environ.get("DIVERNOTE_NOTES_TOKEN")
+    if not url or not token:
+        fail("Divernote notes are not available in this sandbox.", 1)
+    if len(argv) < 2 or argv[0] != "agent-items":
+        fail("Only Divernote notes are available in the sandbox:\n" + USAGE)
+    operation, rest, options = argv[1], argv[2:], {}
+    index = 0
+    while index < len(rest):
+        arg = rest[index]
+        if arg == "--json":
+            index += 1
+            continue
+        if not arg.startswith("--") or index + 1 >= len(rest):
+            fail(f"{arg} needs a value.\n" + USAGE)
+        options[arg[2:]] = rest[index + 1]
+        index += 2
+    if options.pop("type", "note") != "note":
+        fail("Only notes are available in the sandbox (--type note).")
+    body = json.dumps({"operation": operation, "options": options}).encode()
+    request = urllib.request.Request(url, data=body, method="POST",
+                                     headers={"Content-Type": "application/json", "X-Divernote-Token": token})
+    try:
+        with urllib.request.urlopen(request, timeout=90) as response:
+            result = json.load(response)
+    except urllib.error.HTTPError as error:
+        try:
+            fail(json.load(error).get("error", str(error)))
+        except ValueError:
+            fail(str(error), 1)
+    except (urllib.error.URLError, OSError, ValueError) as error:
+        fail(f"Could not reach Divernote on the Mac: {error}", 1)
+    sys.stdout.write(result.get("stdout", ""))
+    sys.stderr.write(result.get("stderr", ""))
+    return result.get("code", 1)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

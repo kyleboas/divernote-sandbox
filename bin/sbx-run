@@ -351,10 +351,53 @@ if [ -n "$DN_PI_SETTINGS" ] && [ ! -e "$HOME/.pi/agent/settings.json" ]; then
   printf '%s\n' "$DN_PI_SETTINGS" > "$HOME/.pi/agent/settings.json"
 fi
 [ -z "$DN_PI_MODELS" ] || cp "$DN_PI_MODELS" "$HOME/.pi/agent/models-store.json"
-unset DN_GIT_AUTH DN_CLAUDE_PROJECTS DN_PI_SETTINGS DN_PI_MODELS
+if [ -n "$DN_NOTES_CLI" ] && [ -n "$DIVERNOTE_NOTES_URL" ]; then
+  mkdir -p "$HOME/.local/bin"
+  ln -sf "$DN_NOTES_CLI" "$HOME/.local/bin/divernote"
+  export PATH="$HOME/.local/bin:$PATH"
+fi
+unset DN_GIT_AUTH DN_CLAUDE_PROJECTS DN_PI_SETTINGS DN_PI_MODELS DN_NOTES_CLI
 cd "$DN_CWD"
 exec "$@"
 '''
+
+def note(text):
+    try:
+        with open(STATE / "notes-bridge.log", "a") as log:
+            log.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {text}\n")
+    except OSError:
+        pass
+
+
+def open_notes_bridge(name, env):
+    """Start the notes bridge and let this sandbox reach its port. Never stops a launch."""
+    try:
+        sys.path.insert(0, str(HERE))
+        import notes_bridge
+        bridge = notes_bridge.start(SEARCH_PATH, env)
+        if not bridge:
+            note(f"{name}: no divernote command on this Mac; notes are unavailable")
+            return None
+        allowed = sbx("policy", "allow", "network", "--sandbox", name, f"localhost:{bridge.port}", check=False)
+        if allowed.returncode:
+            note(f"{name}: could not allow the notes port: {(allowed.stderr or allowed.stdout).strip()}")
+            bridge.close()
+            return None
+        return bridge
+    except Exception as error:  # notes are optional; the agent still runs
+        note(f"{name}: notes bridge failed: {error!r}")
+        return None
+
+
+def close_notes_bridge(name, bridge):
+    if not bridge:
+        return
+    try:
+        sbx("policy", "rm", "network", "--sandbox", name, "--resource", f"localhost:{bridge.port}", check=False)
+        bridge.close()
+    except Exception as error:
+        note(f"{name}: notes bridge cleanup failed: {error!r}")
+
 
 PASS_THROUGH = ("TERM", "COLORTERM", "LANG", "LC_ALL", "LC_CTYPE", "TZ")
 
@@ -411,6 +454,11 @@ def main():
         read_only.append(screenshots)
         inside["DIVERNOTE_SCREENSHOTS"] = str(screenshots)
 
+    # `divernote` inside the sandbox, limited to notes (see notes_bridge.py).
+    notes_cli = HERE / "divernote-guest"
+    read_only.append(notes_cli)
+    inside["DN_NOTES_CLI"] = str(notes_cli)
+
     # Files the launch names (Pi extensions, settings) are readable, nothing more.
     for arg in args:
         path = Path(arg)
@@ -426,6 +474,11 @@ def main():
         ensure_sandbox(name, cwd, mounts)
     inside.update(credentials(agent, command, env))
     inside.update({key: env[key] for key in PASS_THROUGH if env.get(key)})
+
+    bridge = open_notes_bridge(name, env)
+    if bridge:
+        inside["DIVERNOTE_NOTES_URL"] = f"http://host.docker.internal:{bridge.port}/agent-items"
+        inside["DIVERNOTE_NOTES_TOKEN"] = bridge.token
 
     stop, mirroring = threading.Event(), None
     if outbox:
@@ -445,6 +498,7 @@ def main():
         stop.set()
         if mirroring:
             mirroring.join(timeout=5)
+        close_notes_bridge(name, bridge)
         leave(name)
     return code
 

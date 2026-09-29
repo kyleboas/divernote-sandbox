@@ -42,7 +42,24 @@ One sandbox per Divernote session, named `dn-<session>`:
   keeps the rest of the Desktop out). The agent finds it in
   `$DIVERNOTE_SCREENSHOTS`.
 
-Nothing else on the Mac. The network allows only the hosts in
+Nothing else on the Mac.
+
+## Divernote notes
+
+Inside the sandbox, `divernote` works for notes only:
+
+```sh
+divernote agent-items retrieve --type note [--id <id>] --json
+divernote agent-items add --type note --text <text> [--date <ISO>] --json
+divernote agent-items edit --type note --id <id> --text <text> [--date <ISO>] --json
+```
+
+Each launch starts a small service on the Mac (`bin/notes_bridge.py`,
+127.0.0.1 on a random port, with a random token) that runs exactly those
+commands with the real `divernote`. Tasks, deletes and every other command are
+refused. The port is allowed for that sandbox only while the launch runs.
+Problems are logged to `~/.config/divernotes/sbx/notes-bridge.log`; the agent
+still runs without notes. The network allows only the hosts in
 `kit/spec.yaml`; add one there when an agent needs it.
 
 Credentials stay on the Mac. The sandbox gets placeholders and the sbx proxy
@@ -72,4 +89,5 @@ folder and login in `bin/sbx-run` and install it in `kit/spec.yaml`.
 
 ```sh
 node --test test/index.test.mjs
+python3 -m unittest discover -s test
 ```
