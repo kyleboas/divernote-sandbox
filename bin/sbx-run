@@ -351,58 +351,66 @@ if [ -n "$DN_PI_SETTINGS" ] && [ ! -e "$HOME/.pi/agent/settings.json" ]; then
   printf '%s\n' "$DN_PI_SETTINGS" > "$HOME/.pi/agent/settings.json"
 fi
 [ -z "$DN_PI_MODELS" ] || cp "$DN_PI_MODELS" "$HOME/.pi/agent/models-store.json"
-if [ -n "$DN_NOTES_CLI" ] && [ -n "$DIVERNOTE_NOTES_URL" ]; then
+if [ -n "$DIVERNOTE_BRIDGE_URL" ]; then
   mkdir -p "$HOME/.local/bin"
   ln -sf "$DN_NOTES_CLI" "$HOME/.local/bin/divernote"
+  ln -sf "$DN_TAILSCALE_CLI" "$HOME/.local/bin/tailscale"
   export PATH="$HOME/.local/bin:$PATH"
 fi
-unset DN_GIT_AUTH DN_CLAUDE_PROJECTS DN_PI_SETTINGS DN_PI_MODELS DN_NOTES_CLI
+unset DN_GIT_AUTH DN_CLAUDE_PROJECTS DN_PI_SETTINGS DN_PI_MODELS DN_NOTES_CLI DN_TAILSCALE_CLI
 cd "$DN_CWD"
 exec "$@"
 '''
 
 def note(text):
     try:
-        with open(STATE / "notes-bridge.log", "a") as log:
+        with open(STATE / "host-bridge.log", "a") as log:
             log.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {text}\n")
     except OSError:
         pass
 
 
-def open_notes_bridge(name, env):
-    """Start the notes bridge and let this sandbox reach its port. Never stops a launch."""
+def open_host_bridge(name, env):
+    """Start the host bridge (notes, tailnet URLs) and let this sandbox reach its port. Never stops a launch."""
     try:
         sys.path.insert(0, str(HERE))
-        import notes_bridge
-        bridge = notes_bridge.start(SEARCH_PATH, env)
-        if not bridge:
-            note(f"{name}: no divernote command on this Mac; notes are unavailable")
-            return None
+        import host_bridge
+        bridge = host_bridge.start(SEARCH_PATH, env, name, SBX, STATE)
         allowed = sbx("policy", "allow", "network", "--sandbox", name, f"localhost:{bridge.port}", check=False)
         if allowed.returncode:
-            note(f"{name}: could not allow the notes port: {(allowed.stderr or allowed.stdout).strip()}")
+            note(f"{name}: could not allow the bridge port: {(allowed.stderr or allowed.stdout).strip()}")
             bridge.close()
             return None
         return bridge
-    except Exception as error:  # notes are optional; the agent still runs
-        note(f"{name}: notes bridge failed: {error!r}")
+    except Exception as error:  # the bridge is optional; the agent still runs
+        note(f"{name}: host bridge failed: {error!r}")
         return None
 
 
-def close_notes_bridge(name, bridge):
+def close_host_bridge(name, bridge):
     if not bridge:
         return
     try:
         sbx("policy", "rm", "network", "--sandbox", name, "--resource", f"localhost:{bridge.port}", check=False)
         bridge.close()
     except Exception as error:
-        note(f"{name}: notes bridge cleanup failed: {error!r}")
+        note(f"{name}: host bridge cleanup failed: {error!r}")
 
 
 PASS_THROUGH = ("TERM", "COLORTERM", "LANG", "LC_ALL", "LC_CTYPE", "TZ")
 
 
+def clean_up():
+    """Remove tailnet URLs left by launches that died, e.g. when the worker restarts."""
+    sys.path.insert(0, str(HERE))
+    import host_bridge
+    host_bridge.clean_stale(STATE / "shares", SBX, shutil.which("tailscale", path=SEARCH_PATH))
+    return 0
+
+
 def main():
+    if sys.argv[1:] == ["--clean-up"]:
+        return clean_up()
     options, command, args = parse(sys.argv[1:])
     env = os.environ
     agent = options.get("agent", "")
@@ -454,10 +462,11 @@ def main():
         read_only.append(screenshots)
         inside["DIVERNOTE_SCREENSHOTS"] = str(screenshots)
 
-    # `divernote` inside the sandbox, limited to notes (see notes_bridge.py).
-    notes_cli = HERE / "divernote-guest"
-    read_only.append(notes_cli)
-    inside["DN_NOTES_CLI"] = str(notes_cli)
+    # `divernote` inside the sandbox, limited to notes, and `tailscale`,
+    # limited to serve (see host_bridge.py).
+    for command_name, guest in (("DN_NOTES_CLI", "divernote-guest"), ("DN_TAILSCALE_CLI", "tailscale-guest")):
+        read_only.append(HERE / guest)
+        inside[command_name] = str(HERE / guest)
 
     # Files the launch names (Pi extensions, settings) are readable, nothing more.
     for arg in args:
@@ -475,10 +484,10 @@ def main():
     inside.update(credentials(agent, command, env))
     inside.update({key: env[key] for key in PASS_THROUGH if env.get(key)})
 
-    bridge = open_notes_bridge(name, env)
+    bridge = open_host_bridge(name, env)
     if bridge:
-        inside["DIVERNOTE_NOTES_URL"] = f"http://host.docker.internal:{bridge.port}/agent-items"
-        inside["DIVERNOTE_NOTES_TOKEN"] = bridge.token
+        inside["DIVERNOTE_BRIDGE_URL"] = f"http://host.docker.internal:{bridge.port}"
+        inside["DIVERNOTE_BRIDGE_TOKEN"] = bridge.token
 
     stop, mirroring = threading.Event(), None
     if outbox:
@@ -498,7 +507,7 @@ def main():
         stop.set()
         if mirroring:
             mirroring.join(timeout=5)
-        close_notes_bridge(name, bridge)
+        close_host_bridge(name, bridge)
         leave(name)
     return code
 

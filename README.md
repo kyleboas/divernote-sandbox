@@ -54,13 +54,37 @@ divernote agent-items add --type note --text <text> [--date <ISO>] --json
 divernote agent-items edit --type note --id <id> --text <text> [--date <ISO>] --json
 ```
 
-Each launch starts a small service on the Mac (`bin/notes_bridge.py`,
+Each launch starts a small service on the Mac (`bin/host_bridge.py`,
 127.0.0.1 on a random port, with a random token) that runs exactly those
 commands with the real `divernote`. Tasks, deletes and every other command are
 refused. The port is allowed for that sandbox only while the launch runs.
-Problems are logged to `~/.config/divernotes/sbx/notes-bridge.log`; the agent
+Problems are logged to `~/.config/divernotes/sbx/host-bridge.log`; the agent
 still runs without notes. The network allows only the hosts in
 `kit/spec.yaml`; add one there when an agent needs it.
+
+## Tailscale URLs
+
+Inside the sandbox, `tailscale serve` gives a dev server a URL on your
+tailnet, the same way it does on the Mac:
+
+```sh
+tailscale serve --bg 3000          # or localhost:3000, http://localhost:3000
+tailscale serve status [--json]
+tailscale serve --https=<port> off # or: tailscale serve 3000 off
+tailscale serve reset
+```
+
+The same service on the Mac publishes the port on the Mac's loopback
+(`sbx ports`) and runs `tailscale serve` there, so the URL is
+`https://<mac>.<tailnet>.ts.net:<port>/` and reachable only from your
+tailnet. `tailscale funnel` and every other `tailscale` command are refused.
+The Mac picks the HTTPS port, so read the URL from the output. The dev
+server can listen on localhost: a small relay in the sandbox forwards to it.
+A URL lasts until the agent's turn ends, since the sandbox stops then. A
+launch that dies without cleaning up is cleaned up by the next launch, or when the worker restarts. The Mac
+needs Tailscale running and signed in, with HTTPS certificates on for the
+tailnet. Some dev servers refuse unknown host names (Vite's
+`server.allowedHosts`), the same as when serving from the Mac.
 
 Credentials stay on the Mac. The sandbox gets placeholders and the sbx proxy
 swaps in the real value on the way out: Claude tokens come from the Keychain

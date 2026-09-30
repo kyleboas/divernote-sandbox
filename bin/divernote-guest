@@ -20,7 +20,7 @@ def fail(message, code=2):
 
 
 def main(argv):
-    url, token = os.environ.get("DIVERNOTE_NOTES_URL"), os.environ.get("DIVERNOTE_NOTES_TOKEN")
+    url, token = os.environ.get("DIVERNOTE_BRIDGE_URL"), os.environ.get("DIVERNOTE_BRIDGE_TOKEN")
     if not url or not token:
         fail("Divernote notes are not available in this sandbox.", 1)
     if len(argv) < 2 or argv[0] != "agent-items":
@@ -39,7 +39,7 @@ def main(argv):
     if options.pop("type", "note") != "note":
         fail("Only notes are available in the sandbox (--type note).")
     body = json.dumps({"operation": operation, "options": options}).encode()
-    request = urllib.request.Request(url, data=body, method="POST",
+    request = urllib.request.Request(url.rstrip("/") + "/agent-items", data=body, method="POST",
                                      headers={"Content-Type": "application/json", "X-Divernote-Token": token})
     try:
         with urllib.request.urlopen(request, timeout=90) as response:

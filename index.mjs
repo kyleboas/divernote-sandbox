@@ -1,6 +1,7 @@
 // sbx: every coding agent Divernote starts runs inside a Docker Sandboxes VM,
 // one per session, that sees only the issue folder. See README.md.
 
+import { spawn } from 'node:child_process';
 import { basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -18,6 +19,14 @@ export function sandboxed(launch) {
   return { ...launch, command: RUNNER, args: [...spec, launch.command, ...launch.args] };
 }
 
+// Tailnet URLs of launches that died with the worker are removed when it starts again.
+function cleanUp() {
+  try {
+    spawn(RUNNER, ['--clean-up'], { detached: true, stdio: 'ignore' }).on('error', () => {}).unref();
+  } catch {}
+}
+
 export default function sbx(divernote) {
+  cleanUp();
   divernote.on('agent-launch', launch => sandboxed(launch));
 }

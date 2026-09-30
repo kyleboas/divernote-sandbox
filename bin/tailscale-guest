@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""`tailscale` inside the sandbox: `tailscale serve` only, run on the Mac through the host bridge.
+
+    tailscale serve [--bg] [--https=<port>] <port | localhost:<port> | http://localhost:<port>>
+    tailscale serve --https=<port> off     (or: tailscale serve <port> off)
+    tailscale serve status [--json]
+    tailscale serve reset
+
+The URL is tailnet-only and lasts until the agent's turn ends. Its HTTPS port
+is chosen by the Mac, so read the URL from the output.
+"""
+import json
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+USAGE = __doc__.split("\n\n", 1)[1]
+RELAYS = Path("/tmp/divernote-tailscale")
+
+
+def fail(message, code=1):
+    sys.stderr.write(message.rstrip() + "\n")
+    raise SystemExit(code)
+
+
+def bridge(body):
+    url, token = os.environ.get("DIVERNOTE_BRIDGE_URL"), os.environ.get("DIVERNOTE_BRIDGE_TOKEN")
+    if not url or not token:
+        fail("Tailscale URLs are not available in this sandbox.")
+    request = urllib.request.Request(url.rstrip("/") + "/serve", data=json.dumps(body).encode(), method="POST",
+                                     headers={"Content-Type": "application/json", "X-Divernote-Token": token})
+    try:
+        with urllib.request.urlopen(request, timeout=90) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        try:
+            fail(json.load(error).get("error", str(error)))
+        except ValueError:
+            fail(str(error))
+    except (urllib.error.URLError, OSError, ValueError) as error:
+        fail(f"Could not reach Divernote on the Mac: {error}")
+
+
+# --- Relay -----------------------------------------------------------------------
+# A published port only reaches servers listening on every address, and most
+# dev servers listen on localhost only. Each URL points at a small relay that
+# listens everywhere and forwards to localhost:<port>.
+
+def pipe(source, target):
+    try:
+        while data := source.recv(65536):
+            target.sendall(data)
+    except OSError:
+        pass
+    finally:
+        for sock in (source, target):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+
+def connect(port):
+    for host in ("127.0.0.1", "::1"):
+        try:
+            return socket.create_connection((host, port), timeout=10)
+        except OSError:
+            continue
+    return None
+
+
+def relay(port):
+    server = socket.create_server(("0.0.0.0", 0))
+    print(server.getsockname()[1], flush=True)
+    sys.stdout.close()
+    while True:
+        client, _ = server.accept()
+        threading.Thread(target=forward, args=(client, port), daemon=True).start()
+
+
+def forward(client, port):
+    upstream = connect(port)
+    if not upstream:
+        client.close()
+        return
+    upstream.settimeout(None)
+    threading.Thread(target=pipe, args=(upstream, client), daemon=True).start()
+    pipe(client, upstream)
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def start_relay(port):
+    """The sandbox port the relay for `port` listens on, starting it if needed."""
+    RELAYS.mkdir(parents=True, exist_ok=True)
+    record = RELAYS / f"{port}.json"
+    try:
+        data = json.loads(record.read_text())
+        if alive(data["pid"]):
+            return data["relay"]
+    except (OSError, ValueError, KeyError):
+        pass
+    child = subprocess.Popen([sys.executable, os.path.realpath(__file__), "__relay", str(port)],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             start_new_session=True, text=True)
+    line = child.stdout.readline().strip()
+    if not line.isdigit():
+        fail(f"Could not start a relay for port {port}.")
+    record.write_text(json.dumps({"pid": child.pid, "relay": int(line)}))
+    return int(line)
+
+
+def stop_relay(relay_port):
+    for record in RELAYS.glob("*.json"):
+        try:
+            data = json.loads(record.read_text())
+        except (OSError, ValueError):
+            continue
+        if data.get("relay") == relay_port:
+            try:
+                os.kill(data["pid"], signal.SIGTERM)
+            except (OSError, KeyError, TypeError):
+                pass
+            record.unlink(missing_ok=True)
+
+
+# --- Commands ----------------------------------------------------------------------
+
+def target_port(target):
+    match = re.fullmatch(r"(?:https?://)?(?:(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]):)?(\d{1,5})/?", target)
+    if not match or not 1 <= int(match.group(1)) <= 65535:
+        fail(f"tailscale serve in the sandbox takes a local HTTP port, like 3000 or http://localhost:3000, not {target!r}.\n" + USAGE)
+    return int(match.group(1))
+
+
+def shares():
+    return bridge({"action": "status"}).get("shares") or []
+
+
+def show(share, background):
+    print("Available within your tailnet:\n")
+    print(share["url"])
+    print(f"|-- proxy {share.get('label') or share['port']}\n")
+    if background:
+        print("Serve started and running in the background.")
+        print(f"To disable the proxy, run: tailscale serve --https={share['https']} off")
+
+
+def turn_off(port=None, https=None):
+    for share in shares():
+        if share["https"] == https or (port is not None and share.get("label") == f"http://localhost:{port}"):
+            bridge({"action": "off", "port": share["port"]})
+            stop_relay(share["port"])
+            return share
+    fail(f"Nothing is served on {'https port ' + str(https) if https else 'port ' + str(port)}.")
+
+
+def serve(argv):
+    if argv[:1] == ["status"]:
+        listing = shares()
+        if "--json" in argv[1:]:
+            print(json.dumps(listing, indent=2))
+        elif not listing:
+            print("No serve config")
+        for share in [] if "--json" in argv[1:] else listing:
+            print(f"{share['url']} (tailnet only)\n|-- / proxy {share.get('label') or share['port']}\n")
+        return 0
+    if argv[:1] == ["reset"]:
+        for share in shares():
+            bridge({"action": "off", "port": share["port"]})
+            stop_relay(share["port"])
+        return 0
+    background, https, rest = False, None, []
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg in ("--bg", "--bg=true"):
+            background = True
+        elif arg in ("--yes", "--yes=true", "-y", "--bg=false"):
+            pass
+        elif arg.startswith("--https=") or arg.startswith("--http="):
+            https = arg.split("=", 1)[1]
+        elif arg in ("--https", "--http") and index + 1 < len(argv):
+            index += 1
+            https = argv[index]
+        elif arg.startswith("-"):
+            fail(f"{arg} is not available in the sandbox.\n" + USAGE)
+        else:
+            rest.append(arg)
+        index += 1
+    if https is not None and not https.isdigit():
+        fail(f"--https takes a port number, not {https!r}.")
+    if rest and rest[-1] == "off":
+        if len(rest) == 1 and not https:
+            fail("Say which: tailscale serve --https=<port> off\n" + USAGE)
+        turn_off(port=target_port(rest[0]) if len(rest) > 1 else None, https=int(https) if https else None)
+        return 0
+    if len(rest) != 1:
+        fail(USAGE)
+    port = target_port(rest[0])
+    share = bridge({"action": "on", "port": start_relay(port), "label": f"http://localhost:{port}"})
+    show(share, background)
+    if https and int(https) != share["https"]:
+        print(f"(The Mac chose HTTPS port {share['https']} instead of {https}.)")
+    if background:
+        return 0
+    try:
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+        print("Press Ctrl+C to exit.")
+        signal.pause()
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        bridge({"action": "off", "port": share["port"]})
+        stop_relay(share["port"])
+    return 0
+
+
+def main(argv):
+    if argv[:1] == ["__relay"]:
+        relay(int(argv[1]))
+    if argv[:1] == ["serve"]:
+        return serve(argv[1:])
+    if argv[:1] == ["funnel"]:
+        fail("tailscale funnel is not available in the sandbox; tailscale serve gives a tailnet-only URL.")
+    if argv[:1] in (["version"], ["--version"]):
+        print("divernote-sandbox tailscale (serve only)")
+        return 0
+    fail("Only tailscale serve is available in the sandbox:\n" + USAGE, 2)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
