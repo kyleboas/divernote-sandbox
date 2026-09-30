@@ -105,7 +105,11 @@ sbx's own OpenAI login.
   `~/.bundle` from rubygems.org. Ubuntu packages (`sudo apt-get install`)
   work too.
 - It stops when no agent is using it and none of its tailnet URLs are live,
-  and is removed once Divernote removes the issue folder.
+  and is removed once Divernote removes the issue folder. A watcher
+  (`sbx-run --watch`, one per sandbox, started with the first launch) does
+  this, because Divernote ends a turn by killing the launch. While URLs are
+  live it holds an idle `sbx exec`, since sbx itself stops a sandbox 30
+  seconds after its last session ends.
 - If what a launch needs to see changes, or `kit/` changed and no agent is
   using it, the sandbox is recreated. The work and the conversation live in
   the mounted folders, so nothing is lost.
