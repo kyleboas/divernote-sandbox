@@ -12,9 +12,10 @@ Divernote's own CLI validates IDs, text and dates.
 
 /serve gives a port inside the sandbox a tailnet URL. It publishes that port
 on the Mac's loopback (`sbx ports`) and serves it with `tailscale serve`,
-which is only reachable from the tailnet (never Funnel). Every URL is removed
-when the launch ends.
+which is only reachable from the tailnet (never Funnel). A URL lasts two
+hours, even after the launch ends; sbx-run removes it then.
 """
+import fcntl
 import hmac
 import json
 import os
@@ -23,6 +24,8 @@ import secrets
 import shutil
 import subprocess
 import threading
+import time
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -30,6 +33,7 @@ OPERATIONS = {"retrieve": ("id",), "add": ("text", "date"), "edit": ("id", "text
 MAX_REQUEST = 64 * 1024
 MAX_OUTPUT = 1024 * 1024
 MAX_SHARES = 8
+LIFETIME = 2 * 60 * 60
 
 
 def divernote_command(request):
@@ -71,33 +75,42 @@ def serve_request(request):
 
 
 class Shares:
-    """The tailnet URLs one launch has made, removed again by close().
+    """The tailnet URLs of one sandbox, kept in `folder/<sandbox>.json`.
 
-    Each is recorded in `record` while it exists, so a launch that dies
-    without cleaning up is cleaned up by the next one (clean_stale).
+    A URL outlives the launch that made it: it lasts LIFETIME seconds (asking
+    again renews it) and sbx-run keeps the sandbox running until the last
+    one expires (see expire). Every launch in the sandbox shares the file.
     """
 
-    def __init__(self, sandbox, sbx, tailscale, record):
-        self.sandbox, self.sbx, self.tailscale, self.record = sandbox, sbx, tailscale, record
-        self.shares = {}  # sandbox port -> {"https": host port, "url": ..., "label": ...}
-        self.lock = threading.Lock()
+    def __init__(self, sandbox, sbx, tailscale, folder):
+        self.sandbox, self.sbx, self.tailscale = sandbox, sbx, tailscale
+        self.folder = Path(folder)
+        self.record = self.folder / f"{sandbox}.json"
+
+    @contextmanager
+    def locked(self):
+        """The shares, saved again when the block ends."""
+        self.folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with open(self.folder / f"{self.sandbox}.lock", "a+") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                data = json.loads(self.record.read_text())
+                shares = {int(port): share for port, share in data["shares"].items()}
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                shares = {}
+            yield shares
+            if shares:
+                temporary = self.record.with_suffix(".tmp")
+                temporary.write_text(json.dumps({"sandbox": self.sandbox, "shares": shares}, indent=2) + "\n")
+                os.replace(temporary, self.record)
+            else:
+                self.record.unlink(missing_ok=True)
 
     def run(self, *argv):
         try:
             return subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
         except (OSError, subprocess.TimeoutExpired) as error:
             return subprocess.CompletedProcess(argv, 1, "", str(error))
-
-    def save(self):
-        if not self.shares:
-            self.record.unlink(missing_ok=True)
-            return
-        self.record.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        data = {"pid": os.getpid(), "sandbox": self.sandbox,
-                "shares": [{"port": port, "https": share["https"]} for port, share in self.shares.items()]}
-        temporary = self.record.with_suffix(".tmp")
-        temporary.write_text(json.dumps(data) + "\n")
-        os.replace(temporary, self.record)
 
     def dns_name(self):
         result = self.run(self.tailscale, "status", "--json")
@@ -124,21 +137,29 @@ class Shares:
         # again after a restart, and only this form forgets them.
         self.run(self.sbx, "ports", self.sandbox, "--unpublish", str(port))
 
-    def handle(self, action, port, label):
-        with self.lock:
+    def remove(self, port, share):
+        if self.tailscale:
+            self.run(self.tailscale, "serve", f"--https={share['https']}", "off")
+        self.unpublish(port)
+
+    def handle(self, action, port, label, now=None):
+        now = time.time() if now is None else now
+        with self.locked() as shares:
             if action == "status":
-                return 200, {"shares": self.listing()}
+                return 200, {"shares": [{"port": port, **share} for port, share in sorted(shares.items())]}
             if action == "off":
-                return self.off(port)
-            return self.on(port, label)
+                share = shares.pop(port, None)
+                if not share:
+                    return 404, {"error": f"Sandbox port {port} has no tailnet URL."}
+                self.remove(port, share)
+                return 200, {"port": port, **share}
+            return self.on(shares, port, label, now)
 
-    def listing(self):
-        return [{"port": port, **share} for port, share in sorted(self.shares.items())]
-
-    def on(self, port, label):
-        if port in self.shares:
-            return 200, {"port": port, **self.shares[port]}
-        if len(self.shares) >= MAX_SHARES:
+    def on(self, shares, port, label, now):
+        if port in shares:
+            shares[port]["expires"] = now + LIFETIME
+            return 200, {"port": port, **shares[port]}
+        if len(shares) >= MAX_SHARES:
             return 400, {"error": f"At most {MAX_SHARES} tailnet URLs at a time; turn one off first."}
         if not self.tailscale:
             return 503, {"error": "Tailscale is not installed on the Mac."}
@@ -160,46 +181,21 @@ class Shares:
         if served.returncode:
             self.unpublish(port)
             return 502, {"error": f"tailscale serve failed: {(served.stderr or served.stdout).strip()}"}
-        self.shares[port] = {"https": host_port, "url": f"https://{dns}:{host_port}/", "label": label}
-        self.save()
-        return 200, {"port": port, **self.shares[port]}
+        shares[port] = {"https": host_port, "url": f"https://{dns}:{host_port}/", "label": label, "expires": now + LIFETIME}
+        return 200, {"port": port, **shares[port]}
 
-    def off(self, port):
-        share = self.shares.pop(port, None)
-        if not share:
-            return 404, {"error": f"Sandbox port {port} has no tailnet URL."}
-        self.run(self.tailscale, "serve", f"--https={share['https']}", "off")
-        self.unpublish(port)
-        self.save()
-        return 200, {"port": port, **share}
-
-    def close(self):
-        with self.lock:
-            for port in list(self.shares):
-                self.off(port)
+    def expire(self, everything=False, now=None):
+        """Remove expired URLs (or all of them); how many are left."""
+        now = time.time() if now is None else now
+        with self.locked() as shares:
+            for port, share in list(shares.items()):
+                if everything or share.get("expires", 0) <= now:
+                    self.remove(port, shares.pop(port))
+            return len(shares)
 
 
-def clean_stale(folder, sbx, tailscale):
-    """Remove the tailnet URLs of launches that ended without cleaning up."""
-    for record in Path(folder).glob("*.json"):
-        try:
-            data = json.loads(record.read_text())
-            pid = int(data["pid"])
-            try:
-                os.kill(pid, 0)
-                continue  # still running
-            except ProcessLookupError:
-                pass
-            except PermissionError:
-                continue
-            shares = Shares(str(data["sandbox"]), sbx, tailscale, record)
-            for item in data.get("shares") or []:
-                if tailscale:
-                    shares.run(tailscale, "serve", f"--https={int(item['https'])}", "off")
-                shares.unpublish(int(item["port"]))
-            record.unlink(missing_ok=True)
-        except (OSError, ValueError, KeyError, TypeError):
-            continue
+def sandboxes_with_shares(folder):
+    return sorted(path.stem for path in Path(folder).glob("*.json"))
 
 
 class Bridge:
@@ -264,13 +260,8 @@ class Bridge:
     def close(self):
         self.server.shutdown()
         self.server.server_close()
-        self.shares.close()
 
 
-def start(search_path, env, sandbox, sbx, state):
-    """A running bridge for one launch in `sandbox`; `state` is sbx-run's state folder."""
-    tailscale = shutil.which("tailscale", path=search_path)
-    folder = Path(state) / "shares"
-    clean_stale(folder, sbx, tailscale)
-    shares = Shares(sandbox, sbx, tailscale, folder / f"{sandbox}.{os.getpid()}.json")
+def start(search_path, env, shares):
+    """A running bridge for one launch; `shares` is its sandbox's Shares."""
     return Bridge(shutil.which("divernote", path=search_path), dict(env), shares)

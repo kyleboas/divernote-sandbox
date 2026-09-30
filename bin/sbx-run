@@ -193,6 +193,13 @@ def git_identity(cwd):
 
 # --- Sandbox lifecycle -----------------------------------------------------------
 
+def shares(name):
+    """The sandbox's tailnet URLs (see host_bridge.py)."""
+    sys.path.insert(0, str(HERE))
+    import host_bridge
+    return host_bridge.Shares(name, SBX, shutil.which("tailscale", path=SEARCH_PATH), STATE / "shares")
+
+
 @contextmanager
 def locked(name):
     STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -260,16 +267,19 @@ def ensure_template():
 
 
 def ensure_sandbox(name, cwd, mounts):
-    """Create the sandbox, or recreate it when what it should see has changed.
+    """Create the sandbox, or recreate it when what it should see has changed,
+    or when the kit has changed and no other launch is using it.
 
     Nothing worth keeping lives only in a sandbox: the work and the
     conversation are in the mounted folders.
     """
     state = read_state(name)
     exists = name in existing_sandboxes()
-    if exists and state.get("mounts") == mounts:
+    kit = template_tag()
+    if exists and state.get("mounts") == mounts and (state.get("kit") == kit or state.get("users", 0) > 0):
         return state
     if exists:
+        shares(name).expire(everything=True)
         sbx("rm", "-f", name, check=False)
     template = ensure_template()
     say("preparing a sandbox for this session")
@@ -281,7 +291,7 @@ def ensure_sandbox(name, cwd, mounts):
         if attempt == 2:
             say((result.stderr or result.stdout).strip() or "the sandbox could not be created")
             raise SystemExit(1)
-    state = {"cwd": str(cwd), "mounts": mounts, "users": state.get("users", 0)}
+    state = {"cwd": str(cwd), "mounts": mounts, "kit": kit, "users": state.get("users", 0)}
     write_state(name, state)
     return state
 
@@ -294,14 +304,58 @@ def join(name):
 
 
 def leave(name):
-    """Stop the sandbox once nothing is using it, so it holds no memory."""
+    """Stop the sandbox once nothing is using it, so it holds no memory.
+
+    A sandbox with tailnet URLs keeps running until they expire, so the
+    server behind them still answers after the agent's turn; a watcher
+    stops it then.
+    """
     with locked(name):
         state = read_state(name)
         state["users"] = max(0, state.get("users", 0) - 1)
         write_state(name, state)
         if state["users"] == 0:
-            subprocess.Popen([SBX, "stop", name], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, start_new_session=True)
+            if shares(name).expire():
+                start_watcher(name)
+            else:
+                subprocess.Popen([SBX, "stop", name], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def start_watcher(name):
+    """One `sbx-run --watch <name>` per sandbox, outliving the launch."""
+    try:
+        pid = int((STATE / f"{name}.watch").read_text())
+        os.kill(pid, 0)
+        return
+    except (OSError, ValueError):
+        pass
+    watcher = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--watch", name],
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               start_new_session=True)
+    (STATE / f"{name}.watch").write_text(str(watcher.pid))
+
+
+def watch(name):
+    """Remove the sandbox's URLs as they expire; stop it after the last one if nothing uses it."""
+    try:
+        while True:
+            time.sleep(60)
+            with locked(name):
+                state = read_state(name)
+                gone = not Path(state.get("cwd", "/")).exists() or name not in running_sandboxes()
+                if shares(name).expire(everything=gone):
+                    continue
+                if state.get("users", 0) == 0 and not gone:
+                    sbx("stop", name, check=False)
+                return 0
+    finally:
+        (STATE / f"{name}.watch").unlink(missing_ok=True)
+
+
+def running_sandboxes():
+    listing = json.loads(sbx("ls", "--json").stdout or "{}")
+    return {item.get("name") for item in listing.get("sandboxes") or [] if item.get("status") == "running"}
 
 
 def collect_garbage():
@@ -313,6 +367,7 @@ def collect_garbage():
                 state = read_state(name)
                 if state.get("users", 0) or Path(state.get("cwd", "/")).exists():
                     continue
+                shares(name).expire(everything=True)
                 sbx("rm", "-f", name, check=False)
                 path.unlink(missing_ok=True)
                 shutil.rmtree(STATE / "outbox" / name, ignore_errors=True)
@@ -375,7 +430,7 @@ def open_host_bridge(name, env):
     try:
         sys.path.insert(0, str(HERE))
         import host_bridge
-        bridge = host_bridge.start(SEARCH_PATH, env, name, SBX, STATE)
+        bridge = host_bridge.start(SEARCH_PATH, env, shares(name))
         allowed = sbx("policy", "allow", "network", "--sandbox", name, f"localhost:{bridge.port}", check=False)
         if allowed.returncode:
             note(f"{name}: could not allow the bridge port: {(allowed.stderr or allowed.stdout).strip()}")
@@ -401,16 +456,23 @@ PASS_THROUGH = ("TERM", "COLORTERM", "LANG", "LC_ALL", "LC_CTYPE", "TZ")
 
 
 def clean_up():
-    """Remove tailnet URLs left by launches that died, e.g. when the worker restarts."""
+    """When the worker starts: remove URLs whose sandbox has stopped (e.g. after a restart), watch the rest."""
     sys.path.insert(0, str(HERE))
     import host_bridge
-    host_bridge.clean_stale(STATE / "shares", SBX, shutil.which("tailscale", path=SEARCH_PATH))
+    running = running_sandboxes()
+    for name in host_bridge.sandboxes_with_shares(STATE / "shares"):
+        if name in running:
+            start_watcher(name)
+        else:
+            shares(name).expire(everything=True)
     return 0
 
 
 def main():
     if sys.argv[1:] == ["--clean-up"]:
         return clean_up()
+    if sys.argv[1:2] == ["--watch"] and len(sys.argv) == 3:
+        return watch(sys.argv[2])
     options, command, args = parse(sys.argv[1:])
     env = os.environ
     agent = options.get("agent", "")

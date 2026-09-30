@@ -13,6 +13,8 @@ environment:
     DISABLE_ERROR_REPORTING: "1"
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
     PI_SKIP_VERSION_CHECK: "1"
+    # Gems go in the home folder, so `bundle install` needs no sudo.
+    BUNDLE_PATH: /home/agent/.bundle
 
 setup:
   install:
@@ -20,6 +22,10 @@ setup:
     - command: "claude --version 2>/dev/null | grep -q '^2.1.284 ' && pi --version 2>/dev/null | grep -qx 0.87.0 || npm install -g @anthropic-ai/claude-code@2.1.284 @earendil-works/pi-coding-agent@0.87.0 --fetch-retries=5"
       user: "0"
       description: Install Claude Code and Pi
+    # Ruby for Jekyll sites. The image's own startup runs apt-get too, hence the lock wait.
+    - command: "command -v bundle >/dev/null || { apt-get -o DPkg::Lock::Timeout=300 update -qq && DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y -qq ruby-full ruby-bundler build-essential; }"
+      user: "0"
+      description: Install Ruby, Bundler and build tools
 
 # Everything else is blocked. Add a host here when an agent needs it.
 permissions:
@@ -40,3 +46,5 @@ permissions:
       - raw.githubusercontent.com:443
       # Packages
       - registry.npmjs.org:443
+      - rubygems.org:443
+      - index.rubygems.org:443

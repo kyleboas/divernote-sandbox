@@ -6,8 +6,9 @@
     tailscale serve status [--json]
     tailscale serve reset
 
-The URL is tailnet-only and lasts until the agent's turn ends. Its HTTPS port
-is chosen by the Mac, so read the URL from the output.
+The URL is tailnet-only and lasts two hours, even after the agent's turn
+ends; serving the port again renews it. Its HTTPS port is chosen by the Mac,
+so read the URL from the output.
 """
 import json
 import os
@@ -17,6 +18,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -157,6 +159,9 @@ def show(share, background):
     if background:
         print("Serve started and running in the background.")
         print(f"To disable the proxy, run: tailscale serve --https={share['https']} off")
+        hours = round((share["expires"] - time.time()) / 3600, 1)
+        print(f"\nThe URL stays up for {hours:g} hours, after your turn ends too. Start the server so it")
+        print("survives your turn, e.g. `setsid nohup <command> > /tmp/server.log 2>&1 &`.")
 
 
 def turn_off(port=None, https=None):

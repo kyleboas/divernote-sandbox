@@ -80,9 +80,12 @@ The same service on the Mac publishes the port on the Mac's loopback
 tailnet. `tailscale funnel` and every other `tailscale` command are refused.
 The Mac picks the HTTPS port, so read the URL from the output. The dev
 server can listen on localhost: a small relay in the sandbox forwards to it.
-A URL lasts until the agent's turn ends, since the sandbox stops then. A
-launch that dies without cleaning up is cleaned up by the next launch, or when the worker restarts. The Mac
-needs Tailscale running and signed in, with HTTPS certificates on for the
+A URL lasts two hours, even after the agent's turn ends: the sandbox keeps
+running until its last URL expires, then stops. Serving the port again
+renews it. The dev server has to outlive the turn too, so the agent is told
+to start it with `setsid nohup`. URLs are removed early when the issue folder
+is removed, the sandbox is recreated, or the worker starts and finds the
+sandbox stopped (e.g. after a restart). The Mac needs Tailscale running and signed in, with HTTPS certificates on for the
 tailnet. Some dev servers refuse unknown host names (Vite's
 `server.allowedHosts`), the same as when serving from the Mac.
 
@@ -98,10 +101,14 @@ sbx's own OpenAI login.
   shows `divernote-sandbox`). The image is built once, and again whenever
   `kit/` changes, which takes a few minutes. To update Claude Code or Pi,
   change their versions in `kit/spec.yaml`.
-- It stops when no agent is using it and is removed once Divernote removes
-  the issue folder.
-- If what a launch needs to see changes, the sandbox is recreated. The work
-  and the conversation live in the mounted folders, so nothing is lost.
+- The image also has Ruby and Bundler, for Jekyll sites; gems install into
+  `~/.bundle` from rubygems.org. Ubuntu packages (`sudo apt-get install`)
+  work too.
+- It stops when no agent is using it and none of its tailnet URLs are live,
+  and is removed once Divernote removes the issue folder.
+- If what a launch needs to see changes, or `kit/` changed and no agent is
+  using it, the sandbox is recreated. The work and the conversation live in
+  the mounted folders, so nothing is lost.
 
 ## Other agents
 

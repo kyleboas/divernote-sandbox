@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bin"))
-from host_bridge import Shares, clean_stale, divernote_command, serve_request  # noqa: E402
+from host_bridge import LIFETIME, Shares, divernote_command, sandboxes_with_shares, serve_request  # noqa: E402
 
 
 class NotesOnly(unittest.TestCase):
@@ -55,11 +55,11 @@ class TailnetUrls(unittest.TestCase):
         for name in ("sbx", "tailscale"):
             (self.dir / name).write_text(FAKE)
             (self.dir / name).chmod(stat.S_IRWXU)
-        self.record = self.dir / "shares" / "dn-x.1.json"
-        self.shares = Shares("dn-x", str(self.dir / "sbx"), str(self.dir / "tailscale"), self.record)
+        self.folder = self.dir / "shares"
+        self.shares = Shares("dn-x", str(self.dir / "sbx"), str(self.dir / "tailscale"), self.folder)
 
     def calls(self):
-        return [json.loads(line) for line in self.log.read_text().splitlines()]
+        return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
 
     def test_requests_are_validated(self):
         self.assertEqual(serve_request({"action": "on", "port": 3000, "label": "x"})[0], ("on", 3000, "x"))
@@ -68,35 +68,40 @@ class TailnetUrls(unittest.TestCase):
                         {"action": "funnel", "port": 3000}, {"action": "on", "port": 3000, "label": 1}, []):
             self.assertIsNone(serve_request(request)[0], request)
 
-    def test_a_port_gets_a_tailnet_url_and_close_removes_it(self):
-        status, share = self.shares.handle("on", 40001, "http://localhost:3000")
+    def test_a_port_gets_a_tailnet_url(self):
+        status, share = self.shares.handle("on", 40001, "http://localhost:3000", now=1000)
         self.assertEqual(status, 200)
         # 49151 is already served on the Mac, so it is given back and the next port used.
         self.assertEqual(share["https"], 49152)
         self.assertEqual(share["url"], "https://mac.tail.ts.net:49152/")
+        self.assertEqual(share["expires"], 1000 + LIFETIME)
         self.assertIn(["sbx", "ports", "dn-x", "--unpublish", "40001"], self.calls())
         self.assertIn(["tailscale", "serve", "--bg", "--yes", "--https=49152", "http://127.0.0.1:49152"], self.calls())
-        self.assertEqual(json.loads(self.record.read_text())["shares"], [{"port": 40001, "https": 49152}])
-        self.assertEqual(self.shares.handle("on", 40001, "")[1]["https"], 49152)  # asking again reuses it
-        self.shares.close()
-        self.assertIn(["tailscale", "serve", "--https=49152", "off"], self.calls())
-        self.assertIn(["sbx", "ports", "dn-x", "--unpublish", "40001"], self.calls())
-        self.assertFalse(self.record.exists())
-        self.assertEqual(self.shares.handle("off", 40001, "")[0], 404)
 
-    def test_a_dead_launchs_urls_are_removed(self):
-        self.record.parent.mkdir(parents=True)
-        self.record.write_text(json.dumps({"pid": 2 ** 22 + 12345, "sandbox": "dn-x", "shares": [{"port": 40001, "https": 49160}]}))
-        live = self.record.parent / "dn-y.2.json"
-        live.write_text(json.dumps({"pid": os.getpid(), "sandbox": "dn-y", "shares": [{"port": 1, "https": 2}]}))
-        clean_stale(self.record.parent, str(self.dir / "sbx"), str(self.dir / "tailscale"))
-        self.assertEqual(self.calls(), [["tailscale", "serve", "--https=49160", "off"],
-                                        ["sbx", "ports", "dn-x", "--unpublish", "40001"]])
-        self.assertFalse(self.record.exists())
-        self.assertTrue(live.exists())
+    def test_urls_outlive_the_launch_and_expire(self):
+        self.shares.handle("on", 40001, "", now=1000)
+        # Another launch in the same sandbox sees it, and asking again renews it.
+        other = Shares("dn-x", str(self.dir / "sbx"), str(self.dir / "tailscale"), self.folder)
+        self.assertEqual([item["port"] for item in other.handle("status", None, None)[1]["shares"]], [40001])
+        self.assertEqual(other.handle("on", 40001, "", now=2000)[1]["expires"], 2000 + LIFETIME)
+        self.assertEqual(self.shares.expire(now=1000 + LIFETIME), 1)
+        self.assertNotIn(["tailscale", "serve", "--https=49152", "off"], self.calls())
+        self.assertEqual(self.shares.expire(now=2000 + LIFETIME), 0)
+        self.assertIn(["tailscale", "serve", "--https=49152", "off"], self.calls())
+        self.assertFalse((self.folder / "dn-x.json").exists())
+        self.assertEqual(sandboxes_with_shares(self.folder), [])
+
+    def test_off_and_expire_everything(self):
+        self.shares.handle("on", 40001, "", now=1000)
+        self.shares.handle("on", 40002, "", now=1000)
+        self.assertEqual(sandboxes_with_shares(self.folder), ["dn-x"])
+        self.assertEqual(self.shares.handle("off", 40001, "")[0], 200)
+        self.assertEqual(self.shares.handle("off", 40001, "")[0], 404)
+        self.assertEqual(self.shares.expire(everything=True, now=1000), 0)
+        self.assertIn(["sbx", "ports", "dn-x", "--unpublish", "40002"], self.calls())
 
     def test_without_tailscale_it_says_so(self):
-        shares = Shares("dn-x", str(self.dir / "sbx"), None, self.record)
+        shares = Shares("dn-x", str(self.dir / "sbx"), None, self.folder)
         status, body = shares.handle("on", 40001, "")
         self.assertEqual(status, 503)
         self.assertIn("not installed", body["error"])
